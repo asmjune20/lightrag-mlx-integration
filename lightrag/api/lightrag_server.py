@@ -1,0 +1,716 @@
+"""
+LightRAG FastAPI Server
+"""
+
+from fastapi import FastAPI, Depends, HTTPException, status
+import asyncio
+import os
+import logging
+import logging.config
+import uvicorn
+import pipmaster as pm
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import RedirectResponse
+from pathlib import Path
+import configparser
+from ascii_colors import ASCIIColors
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+from lightrag.api.utils_api import (
+    get_combined_auth_dependency,
+    display_splash_screen,
+    check_env_file,
+)
+from .config import (
+    global_args,
+    update_uvicorn_mode_config,
+    get_default_host,
+)
+from lightrag.utils import get_env_value
+import sys
+from lightrag import LightRAG, __version__ as core_version
+from lightrag.api import __api_version__
+from lightrag.types import GPTKeywordExtractionFormat
+from lightrag.utils import EmbeddingFunc
+from lightrag.constants import (
+    DEFAULT_LOG_MAX_BYTES,
+    DEFAULT_LOG_BACKUP_COUNT,
+    DEFAULT_LOG_FILENAME,
+)
+from lightrag.api.routers.document_routes import (
+    DocumentManager,
+    create_document_routes,
+    run_scanning_process,
+)
+from lightrag.api.routers.query_routes import create_query_routes
+from lightrag.api.routers.graph_routes import create_graph_routes
+from lightrag.api.routers.ollama_api import OllamaAPI
+
+from lightrag.utils import logger, set_verbose_debug
+from lightrag.kg.shared_storage import (
+    get_namespace_data,
+    get_pipeline_status_lock,
+    initialize_pipeline_status,
+)
+from fastapi.security import OAuth2PasswordRequestForm
+from lightrag.api.auth import auth_handler
+
+# use the .env that is inside the current folder
+# allows to use different .env file for each lightrag instance
+# the OS environment variables take precedence over the .env file
+load_dotenv(dotenv_path=".env", override=True)
+
+
+webui_title = os.getenv("WEBUI_TITLE")
+webui_description = os.getenv("WEBUI_DESCRIPTION")
+
+# Initialize config parser
+config = configparser.ConfigParser()
+config.read("config.ini")
+
+# Global authentication configuration
+auth_configured = bool(auth_handler.accounts)
+
+# Initialize document manager globally
+doc_manager = DocumentManager(global_args.input_dir)
+rag_instance = None  # Will be initialized in lifespan
+
+
+def get_rag_instance():
+    if rag_instance is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="RAG service is not initialized.",
+        )
+    return rag_instance
+
+
+def create_app(args):
+    # Setup logging
+    logger.setLevel(args.log_level)
+    set_verbose_debug(args.verbose)
+
+    # Verify that bindings are correctly setup
+    if args.llm_binding not in [
+        "lollms",
+        "ollama",
+        "openai",
+        "openai-ollama",
+        "azure_openai",
+    ]:
+        raise Exception("llm binding not supported")
+
+    if args.embedding_binding not in ["lollms", "ollama", "openai", "azure_openai", "local"]:
+        raise Exception("embedding binding not supported")
+
+    # Set default hosts if not provided
+    if args.llm_binding_host is None:
+        args.llm_binding_host = get_default_host(args.llm_binding)
+
+    if args.embedding_binding_host is None:
+        args.embedding_binding_host = get_default_host(args.embedding_binding)
+
+    # Add SSL validation
+    if args.ssl:
+        if not args.ssl_certfile or not args.ssl_keyfile:
+            raise Exception(
+                "SSL certificate and key files must be provided when SSL is enabled"
+            )
+        if not os.path.exists(args.ssl_certfile):
+            raise Exception(f"SSL certificate file not found: {args.ssl_certfile}")
+        if not os.path.exists(args.ssl_keyfile):
+            raise Exception(f"SSL key file not found: {args.ssl_keyfile}")
+
+    # Check if API key is provided either through env var or args
+    api_key = os.getenv("LIGHTRAG_API_KEY") or args.key
+
+    # Initialize document manager
+    doc_manager = DocumentManager(args.input_dir)
+
+    # Initialize RAG instance
+    rag = initialize_rag_instance(args)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        """Lifespan context manager for startup and shutdown events"""
+        # Store background tasks
+        app.state.background_tasks = set()
+
+        try:
+            # Initialize database connections
+            await rag.initialize_storages()
+
+            await initialize_pipeline_status()
+            pipeline_status = await get_namespace_data("pipeline_status")
+
+            should_start_autoscan = False
+            async with get_pipeline_status_lock():
+                # Auto scan documents if enabled
+                if args.auto_scan_at_startup:
+                    if not pipeline_status.get("autoscanned", False):
+                        pipeline_status["autoscanned"] = True
+                        should_start_autoscan = True
+
+            # Only run auto scan when no other process started it first
+            if should_start_autoscan:
+                # Create background task
+                task = asyncio.create_task(
+                    run_scanning_process(rag, doc_manager)
+                )
+                app.state.background_tasks.add(task)
+                task.add_done_callback(app.state.background_tasks.discard)
+                logger.info(f"Process {os.getpid()} auto scan task started at startup.")
+
+            ASCIIColors.green("\nServer is ready to accept connections! 🚀\n")
+
+            yield
+
+        finally:
+            # Clean up database connections
+            await rag.finalize_storages()
+
+    # Initialize FastAPI
+    app_kwargs = {
+        "title": "LightRAG Server API",
+        "description": "Providing API for LightRAG core, Web UI and Ollama Model Emulation"
+        + "(With authentication)"
+        if api_key
+        else "",
+        "version": __api_version__,
+        "openapi_url": "/openapi.json",  # Explicitly set OpenAPI schema URL
+        "docs_url": "/docs",  # Explicitly set docs URL
+        "redoc_url": "/redoc",  # Explicitly set redoc URL
+        "lifespan": lifespan,
+    }
+
+    # Configure Swagger UI parameters
+    # Enable persistAuthorization and tryItOutEnabled for better user experience
+    app_kwargs["swagger_ui_parameters"] = {
+        "persistAuthorization": True,
+        "tryItOutEnabled": True,
+    }
+
+    app = FastAPI(**app_kwargs)
+
+    def get_cors_origins():
+        """Get allowed origins from global_args
+        Returns a list of allowed origins, defaults to ["*"] if not set
+        """
+        origins_str = global_args.cors_origins
+        if origins_str == "*":
+            return ["*"]
+        return [origin.strip() for origin in origins_str.split(",")]
+
+    # Add CORS middleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=get_cors_origins(),
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # Create combined auth dependency for all endpoints
+    combined_auth = get_combined_auth_dependency(api_key)
+
+    # Add routes
+    app.include_router(
+        create_document_routes(
+            rag,
+            doc_manager,
+            api_key,
+        )
+    )
+    app.include_router(create_query_routes(rag, api_key, args.top_k))
+    app.include_router(create_graph_routes(rag, api_key))
+
+    # Add Ollama API routes
+    ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)
+    app.include_router(ollama_api.router, prefix="/api")
+
+    @app.get("/")
+    async def redirect_to_webui():
+        """Redirect root path to /webui"""
+        return RedirectResponse(url="/webui")
+
+    @app.get("/auth-status")
+    async def get_auth_status():
+        """Get authentication status and guest token if auth is not configured"""
+
+        if not auth_handler.accounts:
+            # Authentication not configured, return guest token
+            guest_token = auth_handler.create_token(
+                username="guest", role="guest", metadata={"auth_mode": "disabled"}
+            )
+            return {
+                "auth_configured": False,
+                "access_token": guest_token,
+                "token_type": "bearer",
+                "auth_mode": "disabled",
+                "message": "Authentication is disabled. Using guest access.",
+                "core_version": core_version,
+                "api_version": __api_version__,
+                "webui_title": webui_title,
+                "webui_description": webui_description,
+                "auth_enabled": auth_configured,
+                "auto_scan_at_startup": args.auto_scan_at_startup,
+            }
+
+        return {
+            "auth_configured": True,
+            "auth_mode": "enabled",
+            "core_version": core_version,
+            "api_version": __api_version__,
+            "webui_title": webui_title,
+            "webui_description": webui_description,
+            "auth_enabled": auth_configured,
+            "auto_scan_at_startup": args.auto_scan_at_startup,
+        }
+
+    @app.post("/login")
+    async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+        if not auth_handler.accounts:
+            # Authentication not configured, return guest token
+            guest_token = auth_handler.create_token(
+                username="guest", role="guest", metadata={"auth_mode": "disabled"}
+            )
+            return {
+                "access_token": guest_token,
+                "token_type": "bearer",
+                "auth_mode": "disabled",
+                "message": "Authentication is disabled. Using guest access.",
+                "core_version": core_version,
+                "api_version": __api_version__,
+                "webui_title": webui_title,
+                "webui_description": webui_description,
+                "auth_enabled": auth_configured,
+                "auto_scan_at_startup": args.auto_scan_at_startup,
+            }
+        username = form_data.username
+        if auth_handler.accounts.get(username) != form_data.password:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect credentials"
+            )
+
+        # Regular user login
+        user_token = auth_handler.create_token(
+            username=username, role="user", metadata={"auth_mode": "enabled"}
+        )
+        return {
+            "access_token": user_token,
+            "token_type": "bearer",
+            "auth_mode": "enabled",
+            "core_version": core_version,
+            "api_version": __api_version__,
+            "webui_title": webui_title,
+            "webui_description": webui_description,
+            "auth_enabled": auth_configured,
+            "auto_scan_at_startup": args.auto_scan_at_startup,
+        }
+
+    @app.get("/health", dependencies=[Depends(combined_auth)])
+    async def get_status():
+        """Get current system status"""
+        try:
+            pipeline_status = await get_namespace_data("pipeline_status")
+
+            if not auth_configured:
+                auth_mode = "disabled"
+            else:
+                auth_mode = "enabled"
+
+            return {
+                "status": "healthy",
+                "working_directory": str(args.working_dir),
+                "input_directory": str(args.input_dir),
+                "configuration": {
+                    # LLM configuration binding/host address (if applicable)/model (if applicable)
+                    "llm_binding": args.llm_binding,
+                    "llm_binding_host": args.llm_binding_host,
+                    "llm_model": args.llm_model,
+                    # embedding model configuration binding/host address (if applicable)/model (if applicable)
+                    "embedding_binding": args.embedding_binding,
+                    "embedding_binding_host": args.embedding_binding_host,
+                    "embedding_model": args.embedding_model,
+                    "max_tokens": args.max_tokens,
+                    "kv_storage": args.kv_storage,
+                    "doc_status_storage": args.doc_status_storage,
+                    "graph_storage": args.graph_storage,
+                    "vector_storage": args.vector_storage,
+                    "enable_llm_cache_for_extract": args.enable_llm_cache_for_extract,
+                    "enable_llm_cache": args.enable_llm_cache,
+                },
+                "auth_mode": auth_mode,
+                "pipeline_busy": pipeline_status.get("busy", False),
+                "core_version": core_version,
+                "api_version": __api_version__,
+                "webui_title": webui_title,
+                "webui_description": webui_description,
+                "auth_enabled": auth_configured,
+                "auto_scan_at_startup": args.auto_scan_at_startup,
+            }
+        except Exception as e:
+            logger.error(f"Error getting health status: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # Custom StaticFiles class for smart caching
+    class SmartStaticFiles(StaticFiles):  # Renamed from NoCacheStaticFiles
+        async def get_response(self, path: str, scope):
+            response = await super().get_response(path, scope)
+
+            if path.endswith(".html"):
+                response.headers["Cache-Control"] = (
+                    "no-cache, no-store, must-revalidate"
+                )
+                response.headers["Pragma"] = "no-cache"
+                response.headers["Expires"] = "0"
+            elif (
+                "/assets/" in path
+            ):  # Assets (JS, CSS, images, fonts) generated by Vite with hash in filename
+                response.headers["Cache-Control"] = (
+                    "public, max-age=31536000, immutable"
+                )
+            # Add other rules here if needed for non-HTML, non-asset files
+
+            # Ensure correct Content-Type
+            if path.endswith(".js"):
+                response.headers["Content-Type"] = "application/javascript"
+            elif path.endswith(".css"):
+                response.headers["Content-Type"] = "text/css"
+
+            return response
+
+    # Webui mount webui/index.html
+    static_dir = Path(__file__).parent / "webui"
+    static_dir.mkdir(exist_ok=True)
+    app.mount(
+        "/webui",
+        SmartStaticFiles(
+            directory=static_dir, html=True, check_dir=True
+        ),  # Use SmartStaticFiles
+        name="webui",
+    )
+
+    return app
+
+
+def initialize_rag_instance(args):
+    """Initializes the global LightRAG instance."""
+    # Create working directory if it doesn't exist
+    Path(args.working_dir).mkdir(parents=True, exist_ok=True)
+    if args.llm_binding == "lollms" or args.embedding_binding == "lollms":
+        from lightrag.llm.lollms import lollms_model_complete, lollms_embed
+    if args.llm_binding == "ollama" or args.embedding_binding == "ollama":
+        from lightrag.llm.ollama import ollama_model_complete, ollama_embed
+    if args.llm_binding == "openai" or args.embedding_binding == "openai":
+        from lightrag.llm.openai import openai_complete_if_cache, openai_embed
+    if args.llm_binding == "azure_openai" or args.embedding_binding == "azure_openai":
+        from lightrag.llm.azure_openai import (
+            azure_openai_complete_if_cache,
+            azure_openai_embed,
+        )
+    if args.embedding_binding == "local":
+        from lightrag.llm.local_embedder import local_embed
+    if args.llm_binding_host == "openai-ollama" or args.embedding_binding == "ollama":
+        from lightrag.llm.openai import openai_complete_if_cache
+        from lightrag.llm.ollama import ollama_embed
+
+    async def openai_alike_model_complete(
+        prompt,
+        system_prompt=None,
+        history_messages=None,
+        keyword_extraction=False,
+        **kwargs,
+    ) -> str:
+        keyword_extraction = kwargs.pop("keyword_extraction", None)
+        if keyword_extraction:
+            kwargs["response_format"] = GPTKeywordExtractionFormat
+        if history_messages is None:
+            history_messages = []
+        kwargs["temperature"] = args.temperature
+        return await openai_complete_if_cache(
+            args.llm_model,
+            prompt,
+            system_prompt=system_prompt,
+            history_messages=history_messages,
+            base_url=args.llm_binding_host,
+            api_key=args.llm_binding_api_key,
+            **kwargs,
+        )
+
+    async def azure_openai_model_complete(
+        prompt,
+        system_prompt=None,
+        history_messages=None,
+        keyword_extraction=False,
+        **kwargs,
+    ) -> str:
+        keyword_extraction = kwargs.pop("keyword_extraction", None)
+        if keyword_extraction:
+            kwargs["response_format"] = GPTKeywordExtractionFormat
+        if history_messages is None:
+            history_messages = []
+        kwargs["temperature"] = args.temperature
+        return await azure_openai_complete_if_cache(
+            args.llm_model,
+            prompt,
+            system_prompt=system_prompt,
+            history_messages=history_messages,
+            base_url=args.llm_binding_host,
+            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview"),
+            **kwargs,
+        )
+
+    embedding_func_to_use = None
+    embedding_kwargs = {}
+
+    if args.embedding_binding == "lollms":
+        embedding_func_to_use = lollms_embed
+        embedding_kwargs = {
+            "embed_model": args.embedding_model,
+            "host": args.embedding_binding_host,
+            "api_key": args.embedding_binding_api_key,
+        }
+    elif args.embedding_binding == "ollama":
+        embedding_func_to_use = ollama_embed
+        embedding_kwargs = {
+            "embed_model": args.embedding_model,
+            "host": args.embedding_binding_host,
+            "api_key": args.embedding_binding_api_key,
+        }
+    elif args.embedding_binding == "azure_openai":
+        embedding_func_to_use = azure_openai_embed
+        embedding_kwargs = {
+            "model": args.embedding_model,
+            "api_key": args.embedding_binding_api_key,
+        }
+    elif args.embedding_binding == "openai":
+        embedding_func_to_use = openai_embed
+        embedding_kwargs = {
+            "model": args.embedding_model,
+            "base_url": args.embedding_binding_host,
+            "api_key": args.embedding_binding_api_key,
+        }
+    elif args.embedding_binding == "local":
+        embedding_func_to_use = local_embed
+        embedding_kwargs = {"model": args.embedding_model}
+
+    if embedding_func_to_use is None:
+        raise Exception(f"Embedding binding {args.embedding_binding} is not supported")
+
+    # Dynamically get the embedding dimension and max token size from the function if available
+    embedding_dim = getattr(embedding_func_to_use, "embedding_dim", args.embedding_dim)
+    max_token_size = getattr(
+        embedding_func_to_use, "max_token_size", args.max_embed_tokens
+    )
+
+    embedding_func = EmbeddingFunc(
+        embedding_dim=embedding_dim,
+        max_token_size=max_token_size,
+        func=lambda texts: embedding_func_to_use(texts, **embedding_kwargs),
+    )
+
+    # Initialize RAG
+    if args.llm_binding in ["lollms", "ollama", "openai"]:
+        llm_model_func = lollms_model_complete if args.llm_binding == "lollms" else ollama_model_complete if args.llm_binding == "ollama" else openai_alike_model_complete
+        rag_instance = LightRAG(
+            working_dir=args.working_dir,
+            llm_model_func=llm_model_func,
+            llm_model_name=args.llm_model,
+            llm_model_max_async=args.max_async,
+            llm_model_max_token_size=args.max_tokens,
+            chunk_token_size=int(args.chunk_size),
+            chunk_overlap_token_size=int(args.chunk_overlap_size),
+            llm_model_kwargs={
+                "host": args.llm_binding_host,
+                "timeout": args.timeout,
+                "options": {"num_ctx": args.max_tokens},
+                "api_key": args.llm_binding_api_key,
+            }
+            if args.llm_binding == "lollms" or args.llm_binding == "ollama"
+            else {},
+            embedding_func=embedding_func,
+            kv_storage=args.kv_storage,
+            graph_storage=args.graph_storage,
+            vector_storage=args.vector_storage,
+            doc_status_storage=args.doc_status_storage,
+            vector_db_storage_cls_kwargs={
+                "cosine_better_than_threshold": args.cosine_threshold
+            },
+            enable_llm_cache_for_entity_extract=args.enable_llm_cache_for_extract,
+            enable_llm_cache=args.enable_llm_cache,
+            auto_manage_storages_states=False,
+            max_parallel_insert=args.max_parallel_insert,
+            addon_params={"language": args.summary_language},
+            graph_enabled=args.graph_enabled,
+        )
+    else:  # azure_openai
+        llm_model_func = azure_openai_model_complete
+        rag_instance = LightRAG(
+            working_dir=args.working_dir,
+            llm_model_func=llm_model_func,
+            chunk_token_size=int(args.chunk_size),
+            chunk_overlap_token_size=int(args.chunk_overlap_size),
+            llm_model_kwargs={
+                "timeout": args.timeout,
+            },
+            llm_model_name=args.llm_model,
+            llm_model_max_async=args.max_async,
+            llm_model_max_token_size=args.max_tokens,
+            embedding_func=embedding_func,
+            kv_storage=args.kv_storage,
+            graph_storage=args.graph_storage,
+            vector_storage=args.vector_storage,
+            doc_status_storage=args.doc_status_storage,
+            vector_db_storage_cls_kwargs={
+                "cosine_better_than_threshold": args.cosine_threshold
+            },
+            enable_llm_cache_for_entity_extract=args.enable_llm_cache_for_extract,
+            enable_llm_cache=args.enable_llm_cache,
+            auto_manage_storages_states=False,
+            max_parallel_insert=args.max_parallel_insert,
+            addon_params={"language": args.summary_language},
+            graph_enabled=args.graph_enabled,
+        )
+
+    return rag_instance
+
+
+def get_application(args=None):
+    """Factory function for creating the FastAPI application"""
+    if args is None:
+        args = global_args
+
+    # Check for .env file and display a warning if not found
+    check_env_file()
+
+    # Create and return the FastAPI app
+    app = create_app(args)
+    return app
+
+
+def configure_logging():
+    """Configure logging for uvicorn startup"""
+
+    # Reset any existing handlers to ensure clean configuration
+    for logger_name in ["uvicorn", "uvicorn.access", "uvicorn.error", "lightrag"]:
+        logger = logging.getLogger(logger_name)
+        logger.handlers = []
+        logger.filters = []
+
+    # Get log directory path from environment variable
+    log_dir = os.getenv("LOG_DIR", os.getcwd())
+    log_file_path = os.path.abspath(os.path.join(log_dir, DEFAULT_LOG_FILENAME))
+
+    print(f"\nLightRAG log file: {log_file_path}\n")
+    os.makedirs(os.path.dirname(log_dir), exist_ok=True)
+
+    # Get log file max size and backup count from environment variables
+    log_max_bytes = get_env_value("LOG_MAX_BYTES", DEFAULT_LOG_MAX_BYTES, int)
+    log_backup_count = get_env_value("LOG_BACKUP_COUNT", DEFAULT_LOG_BACKUP_COUNT, int)
+
+    logging.config.dictConfig(
+        {
+            "version": 1,
+            "disable_existing_loggers": False,
+            "formatters": {
+                "default": {
+                    "format": "%(levelname)s: %(message)s",
+                },
+                "detailed": {
+                    "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+                },
+            },
+            "handlers": {
+                "console": {
+                    "formatter": "default",
+                    "class": "logging.StreamHandler",
+                    "stream": "ext://sys.stderr",
+                },
+                "file": {
+                    "formatter": "detailed",
+                    "class": "logging.handlers.RotatingFileHandler",
+                    "filename": log_file_path,
+                    "maxBytes": log_max_bytes,
+                    "backupCount": log_backup_count,
+                    "encoding": "utf-8",
+                },
+            },
+            "loggers": {
+                # Configure all uvicorn related loggers
+                "uvicorn": {
+                    "handlers": ["console", "file"],
+                    "level": "INFO",
+                    "propagate": False,
+                },
+                "uvicorn.access": {
+                    "handlers": ["console", "file"],
+                    "level": "INFO",
+                    "propagate": False,
+                    "filters": ["path_filter"],
+                },
+                "uvicorn.error": {
+                    "handlers": ["console", "file"],
+                    "level": "INFO",
+                    "propagate": False,
+                },
+                "lightrag": {
+                    "handlers": ["console", "file"],
+                    "level": "INFO",
+                    "propagate": False,
+                    "filters": ["path_filter"],
+                },
+            },
+            "filters": {
+                "path_filter": {
+                    "()": "lightrag.utils.LightragPathFilter",
+                },
+            },
+        }
+    )
+
+
+def check_and_install_dependencies():
+    """Check and install required dependencies"""
+    required_packages = [
+        "uvicorn",
+        "tiktoken",
+        "fastapi",
+        # Add other required packages here
+    ]
+
+    for package in required_packages:
+        if not pm.is_installed(package):
+            print(f"Installing {package}...")
+            pm.install(package)
+            print(f"{package} installed successfully")
+
+
+def main():
+    # Force loading from .env to ensure it takes precedence
+    load_dotenv(dotenv_path=".env", override=True)
+
+    # Display splash screen with version and credit information
+    display_splash_screen(global_args)
+
+    # Check and install dependencies
+    check_and_install_dependencies()
+
+    # Create the application
+    app = get_application()
+
+    # Start the server
+    uvicorn.run(
+        app,
+        host=global_args.host,
+        port=global_args.port,
+        log_config=configure_logging(),
+        ssl_certfile=global_args.ssl_certfile if global_args.ssl else None,
+        ssl_keyfile=global_args.ssl_keyfile if global_args.ssl else None,
+    )
+
+
+if __name__ == "__main__":
+    main()
